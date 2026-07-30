@@ -25,77 +25,12 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"github.com/xtaci/smux"
 )
-
-// physIfaceIndex 是物理网卡的接口索引，用于 IP_UNICAST_IF 绑定
-// x-tunnel 自身的 WebSocket 连接通过此索引绕过 TUN
-var physIfaceIndex int = -1
-var physIfaceMu sync.RWMutex
-
-func getPhysIfaceIndex() int {
-	physIfaceMu.RLock()
-	defer physIfaceMu.RUnlock()
-	return physIfaceIndex
-}
-
-// bindSocketToPhysNIC 将 socket 绑定到物理网卡，使其绕过 TUN 路由。
-//
-// 物理网卡绑定（-tun 下 physIfaceIndex > 0 才生效）与 -ip 是两回事：
-//   - -ip 只决定"目标服务器解析到哪个 IP"；
-//   - 物理网卡绑定决定"出口接口"（TUN 模式下让控制连接绕开 TUN）。
-//
-// 但二者共用 dialContext 的拨号路径，当 -ip 指向 loopback（如本机
-// 127.0.0.1）时，对 socket 套 IP_UNICAST_IF = WLAN 会让 Windows 在
-// 物理网卡接口上去 connectex 一个回环地址，路由层直接拒绝并抛
-// "connectex: The requested address is not valid in its context"。
-// loopback 流量不经 TUN 也不经任何物理出口接口，物理绑定这一层对
-// 回环目标必须跳过（这跟 -ip 无关，换成 -ip 1.2.3.4 时该绑的继续绑）。
-func bindSocketToPhysNIC(network, address string, c syscall.RawConn) error {
-	ifaceIndex := getPhysIfaceIndex()
-	if ifaceIndex <= 0 {
-		return nil
-	}
-	switch network {
-	case "tcp4", "udp4", "tcp6", "udp6":
-	default:
-		return nil
-	}
-	// 回环目标免绑定：这是 -tun + -ip 127.0.0.1 同用时拨号报错的关键修正。
-	// 非回环（含 -ip 1.2.3.4 这种公网定向）保持原绑定行为不变。
-	if isLoopbackAddress(address) {
-		return nil
-	}
-	isIPv6 := network == "tcp6" || network == "udp6"
-	var sockErr error
-	err := c.Control(func(fd uintptr) {
-		sockErr = setUnicastIF(fd, ifaceIndex, isIPv6)
-	})
-	if err != nil {
-		return err
-	}
-	return sockErr
-}
-
-// isLoopbackAddress 判断 host:port 形式的对端地址是否指向本机回环。
-// 解析失败或非 IP 形式（域名）一律返回 false，保持原有绑定行为不变。
-func isLoopbackAddress(address string) bool {
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		return false
-	}
-	// 容许带方括号的 IPv6 形式，例如 [::1]:443
-	host = strings.Trim(host, "[]")
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsLoopback()
-	}
-	return false
-}
 
 type GlobalConfig struct {
 	DialTimeout        time.Duration
@@ -130,7 +65,6 @@ var (
 	connectionNum    int
 	insecure         bool
 	ips              string
-	proxyAddr        string
 
 	dnsServer string
 	echDomain string
@@ -146,6 +80,7 @@ var (
 	udpBlockPorts map[int]struct{}
 
 	socks5Config *SOCKS5Config
+	proxyAddr    string
 	ipStrategy   byte
 )
 
@@ -171,30 +106,25 @@ func init() {
 	flag.BoolVar(&insecure, "insecure", false, "客户端忽略证书校验（仅 wss 模式生效）")
 	flag.StringVar(&certFile, "cert", "", "TLS证书文件路径（默认:自动生成，仅服务端）")
 	flag.StringVar(&keyFile, "key", "", "TLS密钥文件路径（默认:自动生成，仅服务端）")
-	flag.StringVar(&token, "token", "", "身份验证令牌（WebSocket 子协议）")
+	flag.StringVar(&token, "token", "", "身份验证令牌（WebSocket Subprotocol）")
 	flag.StringVar(&cidrs, "cidr", "0.0.0.0/0,::/0", "允许的来源 IP 范围 (CIDR),多个范围用逗号分隔")
 	flag.StringVar(&dnsServer, "dns", "https://doh.pub/dns-query", "查询 ECH 公钥所用的 DNS 服务器 (支持 DoH 或 UDP，仅 wss 模式生效)")
 	flag.StringVar(&echDomain, "ech", "cloudflare-ech.com", "用于查询 ECH 公钥的域名（仅 wss 模式生效）")
 	flag.BoolVar(&fallback, "fallback", false, "是否禁用 ECH 并回落到普通 TLS 1.3（仅 wss 模式生效，默认 false）")
 	flag.IntVar(&connectionNum, "n", 3, "每个IP建立的WebSocket连接数量")
-	flag.StringVar(&ips, "ips", "", "IP 访问策略（TUN 默认双栈；域名出口按该策略解析）\n 4: 仅IPv4\n 6: 仅IPv6\n 4,6: 域名由服务端解析时 IPv4优先\n 6,4: 域名由服务端解析时 IPv6优先")
-	flag.StringVar(&proxyAddr, "proxy", "", "客户端模式：指定服务端前置 socks5 代理地址，如 socks5://admin:admin@warp-go.railway.internal:40000，空=服务端直连")
+	flag.StringVar(&proxyAddr, "proxy", "", "客户端模式：指定服务端前置 socks5 代理地址，空=服务端直连")
+	flag.StringVar(&ips, "ips", "", "服务端解析目标地址的IP偏好 (仅客户端有效)\n 4: 仅IPv4\n 6: 仅IPv6\n 4,6: IPv4优先\n 6,4: IPv6优先")
 }
 
 func main() {
 	flag.Parse()
 
-	if listenAddr == "" && !tunMode {
+	if listenAddr == "" {
 		flag.Usage()
 		return
 	}
 
 	ipStrategy = parseIPStrategy(ips)
-	if tunMode && strings.TrimSpace(ips) == "" {
-		// 默认启用双栈：即使客户端没有 IPv6，代理模式仍可通过服务端访问 IPv6 站点。
-		// 直连 IPv6 时若本地无公网 IPv6，会自动 fallback 到 IPv4 直连。
-		ipStrategy = IPStrategyDefault
-	}
 	if ips != "" {
 		log.Printf("[客户端] IP 访问策略: %s (code: %d)", ips, ipStrategy)
 	}
@@ -257,17 +187,6 @@ func main() {
 		log.Fatalf("[客户端] 仅支持 ws:// 或 wss:// 协议 (当前: %s)", forwardURL.Scheme)
 	}
 
-	if tunMode {
-		// 先准备物理网卡索引，供 ECH 查询和首批 WebSocket 连接绑定使用。
-		// 后续仅在当前索引失效时才重新探测，而不是每次重连都重探测。
-		ensurePhysIfaceIndex()
-		if idx := getPhysIfaceIndex(); idx > 0 {
-			log.Printf("[客户端] 物理网卡接口索引: %d (WebSocket/ECH 连接将绕过 TUN)", idx)
-		} else {
-			log.Printf("[客户端] 探测物理网卡索引失败")
-		}
-	}
-
 	if scheme == "wss" {
 		if insecure {
 			if !fallback {
@@ -310,114 +229,59 @@ func main() {
 	}
 
 	clientID = uuid.NewString()
-
-	// 通知服务端所需的前置 SOCKS5 代理地址（空 = 直连）
-	var proxyAddrForServer []byte
-
 	log.Printf("[客户端] 客户端ID: %s", clientID)
 
-	echPool = NewECHPool(forwardAddr, connectionNum, targetIPs, clientID, proxyAddrForServer)
+	echPool = NewECHPool(forwardAddr, connectionNum, targetIPs, clientID)
 	echPool.Start()
 
-	// ================= TUN 模式（仅在 Windows 启用） =================
-	if tunMode {
-		// 等待至少一条通道就绪后再启动 TUN
-		// 避免 TUN 路由建立后所有流量被劫持但 smux 通道又不可用
-		log.Printf("[TUN] 等待 smux 通道就绪（最长 60 秒）...")
-		if echPool.WaitForChannelReady(60 * time.Second) {
-			log.Printf("[TUN] 通道已就绪，启动 TUN 模式")
+	// 如果设了 -proxy，等通道就绪后发 proxy 声明流
+	if proxyAddr != "" {
+		go func() {
+			time.Sleep(3 * time.Second)
+			s, _, _, err := echPool.openBestStream()
+			if err != nil {
+				log.Printf("[客户端] proxy声明失败: %v", err)
+				return
+			}
+			defer s.Close()
+			if err := writeSmuxOpenHeader(s, streamKindProxy, 0, proxyAddr); err != nil {
+				log.Printf("[客户端] proxy声明写入头失败: %v", err)
+				return
+			}
+			log.Printf("[客户端] proxy 声明已发送: %s", proxyAddr)
+		}()
+	}
+
+	var wg sync.WaitGroup
+	for _, listenerRule := range listeners {
+		rule := strings.TrimSpace(listenerRule)
+		if rule == "" {
+			continue
+		}
+
+		if strings.HasPrefix(rule, "tcp://") {
+			wg.Add(1)
+			go func(r string) {
+				defer wg.Done()
+				runTCPListener(r)
+			}(rule)
+		} else if strings.HasPrefix(rule, "socks5://") {
+			wg.Add(1)
+			go func(r string) {
+				defer wg.Done()
+				runSOCKS5Listener(r)
+			}(rule)
+		} else if strings.HasPrefix(rule, "http://") {
+			wg.Add(1)
+			go func(r string) {
+				defer wg.Done()
+				runHTTPListener(r)
+			}(rule)
 		} else {
-			log.Printf("[TUN] 通道就绪超时（60s），仍启动 TUN（后续流量将回退直连）")
-		}
-
-		// Load geo data from files specified by -geoip / -geosite flags
-		loadGeoIP()
-		loadGeoSite()
-
-		if forwardAddr == "" {
-			log.Fatalf("[TUN] TUN 模式必须指定服务地址 (-f ws:// 或 wss://)")
-		}
-
-		// Build TUN config
-		routes := []string{"0.0.0.0/0"}
-		tunGatewayCIDR, tunDNSIP := chooseTunIPv4Config()
-		dnsServers := []string{tunDNSIP}
-		gateways := []string{tunGatewayCIDR}
-
-		// TUN 默认启用双栈；只有显式 -ips 4 才禁用 IPv6。
-		enableIPv6 := ipStrategy != IPStrategyIPv4Only
-		if enableIPv6 {
-			gateways = append(gateways, "fdfe:dcba:9876::1/126")
-			routes = append(routes, "::/0")
-		}
-
-		tunCfg := &TunConfig{
-			Name:                   tunName,
-			MTU:                    tunMTU,
-			Gateway:                gateways,
-			DNS:                    dnsServers,
-			AutoSystemRoutingTable: routes,
-		}
-		log.Printf("[TUN] 配置: device=%s, mtu=%d, addr=%v, routes=%v",
-			tunCfg.Name, tunCfg.MTU, tunCfg.Gateway, tunCfg.AutoSystemRoutingTable)
-
-		// 在启动 TUN 之前，先启动 -l 指定的本地监听（socks5/http）
-		// 因为 StartTun 内部 select{} 会永久阻塞，之后的代码不会执行
-		for _, listenerRule := range listeners {
-			rule := strings.TrimSpace(listenerRule)
-			if rule == "" {
-				continue
-			}
-			if strings.HasPrefix(rule, "socks5://") {
-				go runSOCKS5Listener(rule)
-			} else if strings.HasPrefix(rule, "http://") {
-				go runHTTPListener(rule)
-			} else if strings.HasPrefix(rule, "tcp://") {
-				go runTCPListener(rule)
-			}
-		}
-
-		if err := StartTun(tunCfg); err != nil {
-			log.Fatalf("[TUN] TUN 启动失败: %v", err)
+			log.Printf("[客户端] 忽略未知协议的监听地址: %s", rule)
 		}
 	}
-
-	// 非 TUN 模式的本地监听（TUN 模式的已在上面启动）
-	if !tunMode {
-		var wg sync.WaitGroup
-		for _, listenerRule := range listeners {
-			rule := strings.TrimSpace(listenerRule)
-			if rule == "" {
-				continue
-			}
-
-			if strings.HasPrefix(rule, "tcp://") {
-				wg.Add(1)
-				go func(r string) {
-					defer wg.Done()
-					runTCPListener(r)
-				}(rule)
-			} else if strings.HasPrefix(rule, "socks5://") {
-				wg.Add(1)
-				go func(r string) {
-					defer wg.Done()
-					runSOCKS5Listener(r)
-				}(rule)
-			} else if strings.HasPrefix(rule, "http://") {
-				wg.Add(1)
-				go func(r string) {
-					defer wg.Done()
-					runHTTPListener(r)
-				}(rule)
-			} else {
-				log.Printf("[客户端] 忽略未知协议的监听地址: %s", rule)
-			}
-		}
-		wg.Wait()
-	} else {
-		// TUN 模式下 StartTun 内部 select{} 阻塞，这里也阻塞主 goroutine
-		select {}
-	}
+	wg.Wait()
 }
 
 func parseIPStrategy(s string) byte {
@@ -563,6 +427,7 @@ const (
 	streamKindTCP  byte = 1
 	streamKindUDP  byte = 2
 	streamKindPing byte = 3
+	streamKindProxy byte = 4
 )
 
 // ======================== SOCKS5 辅助函数 ========================
@@ -1059,121 +924,6 @@ func buildUnifiedTLSConfig(serverName string) (*tls.Config, error) {
 	return cfgTLS, nil
 }
 
-// physDNSServers 缓存物理网卡的系统 DNS 服务器，供上游 WebSocket
-// 拨号器的 PreferGo 解析器使用。这样解析器只向物理网卡真实 DNS 发起
-// 查询，避免 TUN 适配器通过 SetDNS 推入全局列表的网关地址污染 Go
-// 解析器的迭代顺序，从而消除三通道断开后重连 i/o timeout 的死锁。
-var (
-	physDNSMu       sync.Mutex
-	physDNSServers  []string
-	physDNSIfaceIdx int
-	physDNSStamp    time.Time
-)
-
-// physicalDNSServers 返回与 physIfaceIndex 对应物理网卡的系统 DNS 服务器
-// 列表（"ip:53" 形式），带 30 秒缓存。ifaceIndex <= 0 或取不到任何服务器
-// 时返回 nil，调用方应回退到 Go 的默认行为。
-func physicalDNSServers() []string {
-	idx := getPhysIfaceIndex()
-	if idx <= 0 {
-		return nil
-	}
-	physDNSMu.Lock()
-	defer physDNSMu.Unlock()
-	if physDNSIfaceIdx == idx && !physDNSStamp.IsZero() && time.Since(physDNSStamp) < 30*time.Second {
-		return append([]string(nil), physDNSServers...)
-	}
-	iface, err := net.InterfaceByIndex(idx)
-	if err != nil || iface == nil {
-		return nil
-	}
-	servers := getSystemDNSServers(iface)
-	physDNSServers = append([]string(nil), servers...)
-	physDNSIfaceIdx = idx
-	physDNSStamp = time.Now()
-	return servers
-}
-
-// dialPhysDNS 建立一条绑定到物理网卡、连向给定 DNS 服务器的连接，
-// 交给 Go 的 PreferGo 解析器在其上发送/接收 DNS 报文。
-//
-// 注意：Go 的 PreferGo 解析器在调用 Resolver.Dial 时传入的 network
-// 通常是裸 "udp"/"tcp"，而 bindSocketToPhysNIC 的 IP_UNICAST_IF 绑定
-// 只对 "udp4"/"udp6"/"tcp4"/"tcp6" 生效。这里按 DNS 服务器地址族把
-// network 规范化成带版本的形式，确保真正绑定到物理网卡、绕过 TUN。
-func dialPhysDNS(ctx context.Context, network, server string, control func(string, string, syscall.RawConn) error) (net.Conn, error) {
-	host, _, err := net.SplitHostPort(server)
-	if err != nil {
-		return nil, err
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return nil, errors.New("invalid DNS server: " + server)
-	}
-	v6 := ip.To4() == nil
-	if strings.HasPrefix(network, "tcp") {
-		if v6 {
-			network = "tcp6"
-		} else {
-			network = "tcp4"
-		}
-	} else {
-		if v6 {
-			network = "udp6"
-		} else {
-			network = "udp4"
-		}
-	}
-	d := &net.Dialer{Timeout: 3 * time.Second, Control: control}
-	return d.DialContext(ctx, network, server)
-}
-
-func newPhysicalNetDialer(timeout time.Duration) *net.Dialer {
-	control := func(network, address string, rawC syscall.RawConn) error {
-		return bindSocketToPhysNIC(network, address, rawC)
-	}
-	resolver := &net.Resolver{
-		PreferGo: true,
-		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-			// 忽略 Go 从系统全局 DNS 列表传入的 address（可能被 TUN 网关
-			// 地址污染），改为显式向物理网卡上发现的 DNS 服务器发起查询。
-			idx := getPhysIfaceIndex()
-			servers := physicalDNSServers()
-			log.Printf("[客户端][DNS-DIAG] resolver.Dial network=%s sysAddr=%s physIfaceIdx=%d physServers=%v", network, address, idx, servers)
-			if len(servers) == 0 {
-				// 探测失败或物理网卡未确定，回退到默认行为，避免彻底断网。
-				log.Printf("[客户端][DNS-DIAG] 无物理 DNS 服务器，回退 Go 默认: %s", address)
-				d := &net.Dialer{Timeout: timeout, Control: control}
-				return d.DialContext(ctx, network, address)
-			}
-			var firstErr error
-			for _, srv := range servers {
-				conn, err := dialPhysDNS(ctx, network, srv, control)
-				if err == nil {
-					log.Printf("[客户端][DNS-DIAG] 命中物理 DNS %s (network=%s)", srv, network)
-					return conn, nil
-				}
-				log.Printf("[客户端][DNS-DIAG] 物理 DNS %s 失败: %v", srv, err)
-				if firstErr == nil {
-					firstErr = err
-				}
-			}
-			// 全部物理 DNS 都失败：最后再退回一次 Go 原本想用的地址，给
-			// 系统全局 DNS（含 DoH/等）一次机会，而不是直接报错。
-			d := &net.Dialer{Timeout: timeout, Control: control}
-			if conn, err := d.DialContext(ctx, network, address); err == nil {
-				log.Printf("[客户端][DNS-DIAG] 物理全失败，回退 Go 默认成功: %s", address)
-				return conn, nil
-			}
-			if firstErr != nil {
-				return nil, firstErr
-			}
-			return nil, errors.New("no physical DNS server available")
-		},
-	}
-	return &net.Dialer{Timeout: timeout, Resolver: resolver, Control: control}
-}
-
 func queryHTTPSRecord(domain, dnsServer string) (string, error) {
 	if strings.HasPrefix(dnsServer, "http://") || strings.HasPrefix(dnsServer, "https://") {
 		return queryDoH(domain, dnsServer)
@@ -1188,8 +938,7 @@ func queryDNSUDP(domain, dnsServer string) (string, error) {
 
 	query := buildDNSQuery(domain, typeHTTPS)
 
-	dialer := newPhysicalNetDialer(2 * time.Second)
-	conn, err := dialer.DialContext(context.Background(), "udp", dnsServer)
+	conn, err := net.Dial("udp", dnsServer)
 	if err != nil {
 		return "", fmt.Errorf("连接 DNS 服务器失败: %v", err)
 	}
@@ -1229,14 +978,7 @@ func queryDoH(domain, dohURL string) (string, error) {
 	}
 	req.Header.Set("Accept", "application/dns-message")
 	req.Header.Set("Content-Type", "application/dns-message")
-	dialer := newPhysicalNetDialer(3 * time.Second)
-	transport := &http.Transport{
-		Proxy:               nil,
-		DialContext:         dialer.DialContext,
-		TLSHandshakeTimeout: 3 * time.Second,
-	}
-	defer transport.CloseIdleConnections()
-	client := &http.Client{Timeout: 3 * time.Second, Transport: transport}
+	client := &http.Client{Timeout: 3 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -1700,48 +1442,39 @@ func handleWebSocketChannel(ch *WSChannel) {
 	}
 }
 
-func readSmuxOpenHeader(r io.Reader) (kind byte, strategy byte, proxyFlag byte, target string, err error) {
-	head := make([]byte, 3)
-	if _, err = io.ReadFull(r, head); err != nil {
-		return 0, 0, 0, "", err
+func readSmuxOpenHeader(r io.Reader) (byte, byte, string, error) {
+	head := make([]byte, 4)
+	if _, err := io.ReadFull(r, head); err != nil {
+		return 0, 0, "", err
 	}
-	kind = head[0]
-	strategy = head[1]
-	proxyLen := int(head[2])
-	proxyFlag = 0
-	if proxyLen > 0 {
-		proxyRaw := make([]byte, proxyLen)
-		if _, err = io.ReadFull(r, proxyRaw); err != nil {
-			return 0, 0, 0, "", err
-		}
-		// 动态设置 socks5Config 供后续直连/代理连接使用
-		socks5Config, _ = parseSOCKS5Addr(string(proxyRaw))
-		proxyFlag = 1
-		log.Printf("[服务端] 客户端请求 SOCKS5 前置代理: %s", string(proxyRaw))
-	}
-	// 然后再读 2 字节 target length
-	var targetLenBytesBuf [2]byte
-	if _, err = io.ReadFull(r, targetLenBytesBuf[:]); err != nil {
-		return 0, 0, 0, "", err
-	}
-	targetLen := int(binary.BigEndian.Uint16(targetLenBytesBuf[:]))
+	kind := head[0]
+	strategy := head[1]
+	targetLen := int(binary.BigEndian.Uint16(head[2:4]))
 	targetRaw := make([]byte, targetLen)
 	if targetLen > 0 {
-		if _, err = io.ReadFull(r, targetRaw); err != nil {
-			return 0, 0, 0, "", err
+		if _, err := io.ReadFull(r, targetRaw); err != nil {
+			return 0, 0, "", err
 		}
 	}
-	target = string(targetRaw)
-	return kind, strategy, proxyFlag, target, nil
+	return kind, strategy, string(targetRaw), nil
 }
 
 func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream) {
 	defer stream.Close()
-	kind, strategy, proxyFlag, target, err := readSmuxOpenHeader(stream)
+	kind, strategy, target, err := readSmuxOpenHeader(stream)
 	if err != nil {
 		return
 	}
 	switch kind {
+	case streamKindProxy:
+		targetLen := len(target)
+		if targetLen > 0 && targetLen < 256 {
+			socks5Config, _ = parseSOCKS5Addr(target)
+			if socks5Config != nil {
+				log.Printf("[服务端] 客户端 %s 设置 SOCKS5 前置代理: %s", shortID(session.clientID), target)
+			}
+		}
+		return
 	case streamKindPing:
 		payload := make([]byte, 8)
 		if _, err := io.ReadFull(stream, payload); err != nil {
@@ -1751,12 +1484,9 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 	case streamKindTCP:
 		log.Printf("[服务端] 客户ID:%s TCP 打开: %s, 通道:%d", shortID(session.clientID), target, ch.id)
 		var tcpConn net.Conn
-		if proxyFlag == 1 && socks5Config != nil {
+		if socks5Config != nil {
 			tcpConn, err = dialViaSocks5("tcp", target)
 		} else {
-			if proxyFlag == 1 {
-				log.Printf("[服务端] 客户端请求前置代理但 socks5Config 未设置，直连")
-			}
 			tcpConn, err = dialTCPWithStrategy(target, strategy)
 		}
 		if err != nil {
@@ -1767,7 +1497,7 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 	case streamKindUDP:
 		log.Printf("[服务端] 客户ID:%s SOCKS5 UDP 访问: %s, 通道:%d", shortID(session.clientID), target, ch.id)
 		var relay UDPRelayer
-		if proxyFlag == 1 && socks5Config != nil {
+		if socks5Config != nil {
 			var socksRelay *SOCKS5UDPRelay
 			socksRelay, err = newSOCKS5UDPRelay(target)
 			if err != nil {
@@ -1776,9 +1506,6 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 			}
 			relay = socksRelay
 		} else {
-			if proxyFlag == 1 {
-				log.Printf("[服务端] 客户端请求 SOCKS5 但 socks5Config 未取，直连")
-			}
 			addr, errResolve := resolveUDPWithStrategy(target, strategy)
 			if errResolve != nil {
 				return
@@ -1838,7 +1565,6 @@ func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream
 type ECHPool struct {
 	wsServerAddr  string
 	connectionNum int
-	proxyAddr     []byte
 	targetIPs     []string
 	clientID      string
 
@@ -1846,11 +1572,9 @@ type ECHPool struct {
 	smuxConns     []*smux.Session
 	channelRTT    []int64
 	selectCounter uint64
-	readyCh       chan struct{}
-	readyOnce     sync.Once
 }
 
-func NewECHPool(addr string, n int, ips []string, clientID string, proxyAddr []byte) *ECHPool {
+func NewECHPool(addr string, n int, ips []string, clientID string) *ECHPool {
 	total := n
 	if len(ips) > 0 {
 		total = len(ips) * n
@@ -1860,32 +1584,10 @@ func NewECHPool(addr string, n int, ips []string, clientID string, proxyAddr []b
 		connectionNum: n,
 		targetIPs:     ips,
 		clientID:      clientID,
-		proxyAddr:     proxyAddr,
 		smuxConns:     make([]*smux.Session, total),
 		channelRTT:    make([]int64, total),
-		readyCh:       make(chan struct{}, 1),
 	}
 	return p
-}
-
-// WaitForChannelReady 阻塞直到至少一条 smux 通道就绪或超时。
-func (p *ECHPool) WaitForChannelReady(timeout time.Duration) bool {
-	deadline := time.Now().Add(timeout)
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if p.HasHealthyChannel() {
-			return true
-		}
-		if time.Now().After(deadline) {
-			return false
-		}
-		select {
-		case <-ticker.C:
-		case <-p.readyCh:
-			return true
-		}
-	}
 }
 
 func (p *ECHPool) Start() {
@@ -1907,10 +1609,7 @@ func (p *ECHPool) dialAndServe(idx int, ip string) {
 		ipLabel = "自动解析"
 	}
 	for {
-		if tunMode {
-			ensurePhysIfaceIndex()
-		}
-		wsConn, err := p.dialWebSocketWithECH(p.wsServerAddr, 3, ip, p.clientID, chID)
+		wsConn, err := dialWebSocketWithECH(p.wsServerAddr, 3, ip, p.clientID, chID)
 		if err != nil {
 			log.Printf("[客户端] 通道 %d (IP:%s) 连接失败: %v", chID, ipLabel, err)
 			time.Sleep(3 * time.Second)
@@ -1928,12 +1627,6 @@ func (p *ECHPool) dialAndServe(idx int, ip string) {
 		p.smuxConns[idx] = sess
 		p.channelRTT[idx] = 0
 		p.wsConnsMu.Unlock()
-		p.readyOnce.Do(func() {
-			select {
-			case p.readyCh <- struct{}{}:
-			default:
-			}
-		})
 		log.Printf("[客户端] 通道 %d (IP:%s) 就绪 (smux)", chID, ipLabel)
 		if rtt, err := p.probeChannelRTTOnce(sess, cfg.RTTProbeTimeout); err == nil {
 			atomic.StoreInt64(&p.channelRTT[idx], rtt)
@@ -2000,7 +1693,7 @@ func (p *ECHPool) probeChannelRTTOnce(sess *smux.Session, timeout time.Duration)
 	}
 	defer s.Close()
 	_ = s.SetDeadline(time.Now().Add(timeout))
-	if err := writeSmuxOpenHeader(s, streamKindPing, 0, nil, ""); err != nil {
+	if err := writeSmuxOpenHeader(s, streamKindPing, 0, ""); err != nil {
 		return 0, err
 	}
 	payload := make([]byte, 8)
@@ -2109,29 +1802,14 @@ func (p *ECHPool) openBestStream() (*smux.Stream, int, int, error) {
 	return s, best.idx + 1, decision, nil
 }
 
-// HasHealthyChannel returns true if at least one smux connection is alive.
-// Used by routing logic to decide whether proxy is available.
-func (p *ECHPool) HasHealthyChannel() bool {
-	p.wsConnsMu.RLock()
-	defer p.wsConnsMu.RUnlock()
-	for _, sess := range p.smuxConns {
-		if sess != nil && !sess.IsClosed() {
-			return true
-		}
-	}
-	return false
-}
-
-func writeSmuxOpenHeader(w io.Writer, kind byte, strategy byte, proxyAddr []byte, target string) error {
+func writeSmuxOpenHeader(w io.Writer, kind byte, strategy byte, target string) error {
 	if len(target) > 65535 {
 		return fmt.Errorf("目标地址过长")
 	}
-	head := make([]byte, 5 + len(proxyAddr))
+	head := make([]byte, 4)
 	head[0] = kind
 	head[1] = strategy
-	head[2] = byte(len(proxyAddr))
-	copy(head[3:3+len(proxyAddr)], proxyAddr)
-	binary.BigEndian.PutUint16(head[3+len(proxyAddr):5+len(proxyAddr)], uint16(len(target)))
+	binary.BigEndian.PutUint16(head[2:4], uint16(len(target)))
 	if _, err := w.Write(head); err != nil {
 		return err
 	}
@@ -2147,7 +1825,7 @@ func (p *ECHPool) openTCPStream(target string) (*smux.Stream, int, int, error) {
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	if err := writeSmuxOpenHeader(s, streamKindTCP, ipStrategy, p.proxyAddr, target); err != nil {
+	if err := writeSmuxOpenHeader(s, streamKindTCP, ipStrategy, target); err != nil {
 		_ = s.Close()
 		return nil, 0, 0, err
 	}
@@ -2159,7 +1837,7 @@ func (p *ECHPool) openUDPStream(target string) (*smux.Stream, int, int, error) {
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	if err := writeSmuxOpenHeader(s, streamKindUDP, ipStrategy, p.proxyAddr, target); err != nil {
+	if err := writeSmuxOpenHeader(s, streamKindUDP, ipStrategy, target); err != nil {
 		_ = s.Close()
 		return nil, 0, 0, err
 	}
@@ -2276,81 +1954,7 @@ func handleLocalTCP(c net.Conn, target string) {
 }
 
 // dialWebSocketWithECH：支持 ws:// 与 wss://；仅 wss 使用 TLS/ECH 逻辑
-// detectPhysIfaceIndex 选择一个可用的非 TUN 物理网卡索引（跳过 loopback 和虚拟网卡）
-func detectPhysIfaceIndex() int {
-	// 优先用 GetAdaptersAddresses 原生字段硬判定：必须有默认网关、物理类 IfType、
-	// 非隧道、非环回/link-local、非 ICS 虚拟网关段 192.168.137.x。这样能精准排除
-	// 开启 Wi-Fi 共享(ICS)后出现的 Microsoft Wi-Fi Direct Virtual Adapter。
-	if idx := detectPhysIfaceIndexAPI(); idx > 0 {
-		return idx
-	}
-	// API 不可用或无候选，退回名字启发式兜底。
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return -1
-	}
-	for _, iface := range ifaces {
-		if !isPhysIfaceUsable(&iface) {
-			continue
-		}
-		return iface.Index
-	}
-	return -1
-}
-
-func isPhysIfaceUsable(iface *net.Interface) bool {
-	if iface == nil {
-		return false
-	}
-	if iface.Flags&net.FlagUp == 0 {
-		return false
-	}
-	if iface.Flags&net.FlagLoopback != 0 {
-		return false
-	}
-	name := strings.ToLower(iface.Name)
-	if isVirtualInterface(name) || strings.Contains(name, "tap") {
-		return false
-	}
-	addrs, err := iface.Addrs()
-	if err != nil || len(addrs) == 0 {
-		return false
-	}
-	for _, a := range addrs {
-		if ipNet, ok := a.(*net.IPNet); ok && ipNet.IP.To4() != nil && !ipNet.IP.IsLoopback() {
-			return true
-		}
-	}
-	return false
-}
-
-func ensurePhysIfaceIndex() {
-	physIfaceMu.Lock()
-	defer physIfaceMu.Unlock()
-
-	if physIfaceIndex > 0 {
-		if iface, err := net.InterfaceByIndex(physIfaceIndex); err == nil && isPhysIfaceUsable(iface) {
-			return
-		}
-		prev := physIfaceIndex
-		physIfaceIndex = -1
-		log.Printf("[客户端] 物理网卡接口索引 %d 已失效，重新探测", prev)
-	}
-	newIdx := detectPhysIfaceIndex()
-	if newIdx <= 0 {
-		return
-	}
-	if newIdx != physIfaceIndex {
-		physIfaceIndex = newIdx
-		if iface, err := net.InterfaceByIndex(physIfaceIndex); err == nil {
-			log.Printf("[客户端] 物理网卡接口索引更新: %d (%s)", physIfaceIndex, iface.Name)
-		} else {
-			log.Printf("[客户端] 物理网卡接口索引更新: %d", physIfaceIndex)
-		}
-	}
-}
-
-func (p *ECHPool) dialWebSocketWithECH(addr string, retries int, ip string, clientID string, channelID int) (*websocket.Conn, error) {
+func dialWebSocketWithECH(addr string, retries int, ip string, clientID string, channelID int) (*websocket.Conn, error) {
 	u, err := url.Parse(addr)
 	if err != nil {
 		return nil, err
@@ -2380,31 +1984,14 @@ func (p *ECHPool) dialWebSocketWithECH(addr string, retries int, ip string, clie
 		if token != "" {
 			dialer.Subprotocols = []string{token}
 		}
-		// 自定义 dialer：WebSocket 控制连接必须绕过 TUN。
-		dialContext := func(ctx context.Context, network, address string) (net.Conn, error) {
-			// 如果指定了 -ip，直接用该 IP 连接（目标服务器 IP，非本地绑定）
-			if ip != "" {
+		if ip != "" {
+			dialer.NetDial = func(network, address string) (net.Conn, error) {
 				_, port, _ := net.SplitHostPort(address)
 				if host, p, err := net.SplitHostPort(ip); err == nil {
-					address = net.JoinHostPort(host, p)
-				} else {
-					address = net.JoinHostPort(ip, port)
+					return net.DialTimeout(network, net.JoinHostPort(host, p), cfg.DialTimeout)
 				}
+				return net.DialTimeout(network, net.JoinHostPort(ip, port), cfg.DialTimeout)
 			}
-
-			// 回环目标（-ip 127.0.0.1 / [::1]）既不经 TUN 也不经物理出口接口，
-			// 物理网卡绑定这一层必须跳过；非回环目标（含 -ip 1.2.3.4 公网定向）
-			// 在 -tun 下继续走物理 dialer 绕 TUN，保持原行为。
-			if isLoopbackAddress(address) {
-				nd := &net.Dialer{Timeout: cfg.DialTimeout}
-				return nd.DialContext(ctx, network, address)
-			}
-			d := newPhysicalNetDialer(cfg.DialTimeout)
-			return d.DialContext(ctx, network, address)
-		}
-		dialer.NetDialContext = dialContext
-		dialer.NetDial = func(network, address string) (net.Conn, error) {
-			return dialContext(context.Background(), network, address)
 		}
 		return dialer
 	}
