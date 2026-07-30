@@ -79,9 +79,9 @@ var (
 	clientID      string
 	udpBlockPorts map[int]struct{}
 
-	socks5Config *SOCKS5Config
-	proxyAddr    string
-	ipStrategy   byte
+	serverSOCKS5Config *SOCKS5Config
+	proxyAddr          string
+	ipStrategy         byte
 )
 
 const (
@@ -158,7 +158,7 @@ func main() {
 			if err != nil {
 				log.Fatalf("[服务端] 解析SOCKS5代理地址失败: %v", err)
 			}
-			socks5Config = config
+			serverSOCKS5Config = config
 			log.Printf("[服务端] 使用SOCKS5前置代理: %s", config.Host)
 			if config.Username != "" {
 				log.Printf("[服务端] SOCKS5代理认证已启用")
@@ -185,6 +185,14 @@ func main() {
 	scheme := strings.ToLower(forwardURL.Scheme)
 	if scheme != "wss" && scheme != "ws" {
 		log.Fatalf("[客户端] 仅支持 ws:// 或 wss:// 协议 (当前: %s)", forwardURL.Scheme)
+	}
+	if proxyAddr != "" {
+		config, err := parseSOCKS5Addr(proxyAddr)
+		if err != nil {
+			log.Fatalf("[客户端] 无效的 -proxy 参数: %v", err)
+		}
+		proxyAddr = canonicalSOCKS5Addr(config)
+		log.Printf("[客户端] 请求服务端使用 SOCKS5 出站: %s", config.Host)
 	}
 
 	if scheme == "wss" {
@@ -233,24 +241,6 @@ func main() {
 
 	echPool = NewECHPool(forwardAddr, connectionNum, targetIPs, clientID)
 	echPool.Start()
-
-	// 如果设了 -proxy，等通道就绪后发 proxy 声明流
-	if proxyAddr != "" {
-		go func() {
-			time.Sleep(3 * time.Second)
-			s, _, _, err := echPool.openBestStream()
-			if err != nil {
-				log.Printf("[客户端] proxy声明失败: %v", err)
-				return
-			}
-			defer s.Close()
-			if err := writeSmuxOpenHeader(s, streamKindProxy, 0, proxyAddr); err != nil {
-				log.Printf("[客户端] proxy声明写入头失败: %v", err)
-				return
-			}
-			log.Printf("[客户端] proxy 声明已发送: %s", proxyAddr)
-		}()
-	}
 
 	var wg sync.WaitGroup
 	for _, listenerRule := range listeners {
@@ -424,52 +414,84 @@ func (c *wsNetConn) SetReadDeadline(t time.Time) error { return c.ws.SetReadDead
 func (c *wsNetConn) SetWriteDeadline(t time.Time) error { return c.ws.SetWriteDeadline(t) }
 
 const (
-	streamKindTCP  byte = 1
-	streamKindUDP  byte = 2
-	streamKindPing byte = 3
-	streamKindProxy byte = 4
+	streamKindTCP      byte = 1
+	streamKindUDP      byte = 2
+	streamKindPing     byte = 3
+	streamKindTCPProxy byte = 4
+	streamKindUDPProxy byte = 5
+	maxProxyAddrLength      = 2048
 )
 
 // ======================== SOCKS5 辅助函数 ========================
 
 func parseSOCKS5Addr(addr string) (*SOCKS5Config, error) {
-	addr = strings.TrimPrefix(addr, "socks5://")
-	config := &SOCKS5Config{}
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return nil, errors.New("SOCKS5 地址为空")
+	}
+	if len(addr) > maxProxyAddrLength {
+		return nil, fmt.Errorf("SOCKS5 地址过长（最大 %d 字节）", maxProxyAddrLength)
+	}
 
-	if strings.Contains(addr, "@") {
-		parts := strings.SplitN(addr, "@", 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("无效的SOCKS5地址格式")
+	u, err := url.Parse(addr)
+	if err != nil {
+		return nil, fmt.Errorf("解析 SOCKS5 地址失败: %w", err)
+	}
+	if !strings.EqualFold(u.Scheme, "socks5") {
+		return nil, fmt.Errorf("仅支持 socks5://，收到 %q", u.Scheme)
+	}
+	if u.Hostname() == "" || u.Port() == "" {
+		return nil, errors.New("SOCKS5 地址必须包含 host:port")
+	}
+	if u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return nil, errors.New("SOCKS5 地址不能包含路径、查询参数或片段")
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return nil, fmt.Errorf("SOCKS5 端口 %q 无效", u.Port())
+	}
+
+	config := &SOCKS5Config{Host: net.JoinHostPort(u.Hostname(), u.Port())}
+	if u.User != nil {
+		config.Username = u.User.Username()
+		password, hasPassword := u.User.Password()
+		if config.Username == "" || !hasPassword || password == "" {
+			return nil, errors.New("SOCKS5 认证必须同时提供非空用户名和密码")
 		}
-		auth := parts[0]
-		if strings.Contains(auth, ":") {
-			authParts := strings.SplitN(auth, ":", 2)
-			config.Username = authParts[0]
-			config.Password = authParts[1]
+		if len(config.Username) > 255 || len(password) > 255 {
+			return nil, errors.New("SOCKS5 用户名和密码均不能超过 255 字节")
 		}
-		config.Host = parts[1]
-	} else {
-		config.Host = addr
+		config.Password = password
 	}
 	return config, nil
 }
 
-func dialViaSocks5(network, addr string) (net.Conn, error) {
-	if socks5Config == nil {
+func canonicalSOCKS5Addr(config *SOCKS5Config) string {
+	u := &url.URL{Scheme: "socks5", Host: config.Host}
+	if config.Username != "" {
+		u.User = url.UserPassword(config.Username, config.Password)
+	}
+	return u.String()
+}
+
+func dialViaSocks5(config *SOCKS5Config, network, addr string) (net.Conn, error) {
+	if config == nil {
 		return net.DialTimeout(network, addr, cfg.DialTimeout)
 	}
-	proxyConn, err := net.DialTimeout("tcp", socks5Config.Host, cfg.DialTimeout)
+	proxyConn, err := net.DialTimeout("tcp", config.Host, cfg.DialTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("连接SOCKS5代理失败: %v", err)
+		return nil, fmt.Errorf("连接 SOCKS5 代理 %s 失败: %w", config.Host, err)
 	}
-	if err := socks5Handshake(proxyConn, socks5Config); err != nil {
-		proxyConn.Close()
-		return nil, fmt.Errorf("SOCKS5握手失败: %v", err)
+	_ = proxyConn.SetDeadline(time.Now().Add(cfg.DialTimeout))
+	if err := socks5Handshake(proxyConn, config); err != nil {
+		_ = proxyConn.Close()
+		return nil, fmt.Errorf("SOCKS5 握手失败: %w", err)
 	}
 	if err := socks5Connect(proxyConn, addr); err != nil {
-		proxyConn.Close()
-		return nil, fmt.Errorf("SOCKS5 CONNECT失败: %v", err)
+		_ = proxyConn.Close()
+		return nil, fmt.Errorf("SOCKS5 CONNECT 失败: %w", err)
 	}
+	_ = proxyConn.SetDeadline(time.Time{})
 	return proxyConn, nil
 }
 
@@ -527,34 +549,15 @@ func socks5UserPassAuthSrv(conn net.Conn, username, password string) error {
 }
 
 func socks5Connect(conn net.Conn, addr string) error {
-	host, portStr, err := net.SplitHostPort(addr)
+	host, port, err := splitHostPort(addr)
 	if err != nil {
 		return err
 	}
-	port := 0
-	fmt.Sscanf(portStr, "%d", &port)
-
-	var request []byte
-	ip := net.ParseIP(host)
-	if ip != nil {
-		if ip4 := ip.To4(); ip4 != nil {
-			request = make([]byte, 10)
-			request[0], request[1], request[2], request[3] = 0x05, 0x01, 0x00, 0x01
-			copy(request[4:8], ip4)
-			request[8], request[9] = byte(port>>8), byte(port)
-		} else {
-			request = make([]byte, 22)
-			request[0], request[1], request[2], request[3] = 0x05, 0x01, 0x00, 0x04
-			copy(request[4:20], ip)
-			request[20], request[21] = byte(port>>8), byte(port)
-		}
-	} else {
-		request = make([]byte, 7+len(host))
-		request[0], request[1], request[2], request[3] = 0x05, 0x01, 0x00, 0x03
-		request[4] = byte(len(host))
-		copy(request[5:], host)
-		request[5+len(host)], request[6+len(host)] = byte(port>>8), byte(port)
+	address, err := encodeSOCKS5Address(host, port)
+	if err != nil {
+		return err
 	}
+	request := append([]byte{0x05, 0x01, 0x00}, address...)
 
 	if _, err := conn.Write(request); err != nil {
 		return err
@@ -563,7 +566,7 @@ func socks5Connect(conn net.Conn, addr string) error {
 	if _, err := io.ReadFull(conn, response); err != nil {
 		return err
 	}
-	if response[1] != 0x00 {
+	if response[0] != 0x05 || response[1] != 0x00 {
 		return fmt.Errorf("状态码: %d", response[1])
 	}
 	switch response[3] {
@@ -577,8 +580,45 @@ func socks5Connect(conn net.Conn, addr string) error {
 		_, _ = io.ReadFull(conn, make([]byte, int(lenBuf[0])+2))
 	case 0x04:
 		_, _ = io.ReadFull(conn, make([]byte, 18))
+	default:
+		return fmt.Errorf("未知地址类型: %d", response[3])
 	}
 	return nil
+}
+
+func splitHostPort(addr string) (string, int, error) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", 0, err
+	}
+	if host == "" {
+		return "", 0, errors.New("主机名为空")
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return "", 0, fmt.Errorf("端口 %q 无效", portStr)
+	}
+	return host, port, nil
+}
+
+func encodeSOCKS5Address(host string, port int) ([]byte, error) {
+	var address []byte
+	if ip := net.ParseIP(host); ip != nil {
+		if ip4 := ip.To4(); ip4 != nil {
+			address = append([]byte{0x01}, ip4...)
+		} else {
+			address = append([]byte{0x04}, ip.To16()...)
+		}
+	} else {
+		if len(host) == 0 || len(host) > 255 {
+			return nil, fmt.Errorf("SOCKS5 域名长度必须为 1-255 字节")
+		}
+		address = make([]byte, 0, 2+len(host))
+		address = append(address, 0x03, byte(len(host)))
+		address = append(address, host...)
+	}
+	address = append(address, byte(port>>8), byte(port))
+	return address, nil
 }
 
 // ======================== UDP Relayer (服务端用) ========================
@@ -606,35 +646,39 @@ type SOCKS5UDPRelay struct {
 	tcpConn    net.Conn
 	udpConn    *net.UDPConn
 	relayAddr  *net.UDPAddr
-	targetAddr *net.UDPAddr
+	targetAddr string
 	mu         sync.Mutex
 	closed     bool
 }
 
-func newSOCKS5UDPRelay(targetAddr string) (*SOCKS5UDPRelay, error) {
-	if socks5Config == nil {
+func newSOCKS5UDPRelay(config *SOCKS5Config, targetAddr string) (*SOCKS5UDPRelay, error) {
+	if config == nil {
 		return nil, errors.New("SOCKS5配置为空")
 	}
-	tcpConn, err := net.DialTimeout("tcp", socks5Config.Host, cfg.DialTimeout)
-	if err != nil {
-		return nil, err
+	if _, _, err := splitHostPort(targetAddr); err != nil {
+		return nil, fmt.Errorf("无效的 UDP 目标地址: %w", err)
 	}
-	if err := socks5Handshake(tcpConn, socks5Config); err != nil {
-		tcpConn.Close()
-		return nil, err
+	tcpConn, err := net.DialTimeout("tcp", config.Host, cfg.DialTimeout)
+	if err != nil {
+		return nil, fmt.Errorf("连接 SOCKS5 代理 %s 失败: %w", config.Host, err)
+	}
+	_ = tcpConn.SetDeadline(time.Now().Add(cfg.DialTimeout))
+	if err := socks5Handshake(tcpConn, config); err != nil {
+		_ = tcpConn.Close()
+		return nil, fmt.Errorf("SOCKS5 握手失败: %w", err)
 	}
 	req := []byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
 	if _, err := tcpConn.Write(req); err != nil {
-		tcpConn.Close()
+		_ = tcpConn.Close()
 		return nil, err
 	}
 	resp := make([]byte, 4)
 	if _, err := io.ReadFull(tcpConn, resp); err != nil {
-		tcpConn.Close()
+		_ = tcpConn.Close()
 		return nil, err
 	}
-	if resp[1] != 0x00 {
-		tcpConn.Close()
+	if resp[0] != 0x05 || resp[1] != 0x00 {
+		_ = tcpConn.Close()
 		return nil, fmt.Errorf("UDP ASSOCIATE拒绝: %d", resp[1])
 	}
 	var relayHost string
@@ -665,6 +709,9 @@ func newSOCKS5UDPRelay(targetAddr string) (*SOCKS5UDPRelay, error) {
 			return nil, err
 		}
 		relayHost = net.IP(ipBuf).String()
+	default:
+		_ = tcpConn.Close()
+		return nil, fmt.Errorf("UDP ASSOCIATE 返回未知地址类型: %d", resp[3])
 	}
 	portBuf := make([]byte, 2)
 	if _, err := io.ReadFull(tcpConn, portBuf); err != nil {
@@ -674,38 +721,33 @@ func newSOCKS5UDPRelay(targetAddr string) (*SOCKS5UDPRelay, error) {
 	relayPort := int(portBuf[0])<<8 | int(portBuf[1])
 
 	if relayHost == "0.0.0.0" || relayHost == "::" {
-		h, _, _ := net.SplitHostPort(socks5Config.Host)
+		h, _, _ := net.SplitHostPort(config.Host)
 		relayHost = h
 	}
-	rAddr, errResolve := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", relayHost, relayPort))
+	rAddr, errResolve := net.ResolveUDPAddr("udp", net.JoinHostPort(relayHost, strconv.Itoa(relayPort)))
 	if errResolve != nil {
-		tcpConn.Close()
-		return nil, errResolve
-	}
-
-	tAddr, errResolve := net.ResolveUDPAddr("udp", targetAddr)
-	if errResolve != nil {
-		tcpConn.Close()
+		_ = tcpConn.Close()
 		return nil, errResolve
 	}
 
 	localUDP, errListen := net.ListenUDP("udp", nil)
 	if errListen != nil {
-		tcpConn.Close()
+		_ = tcpConn.Close()
 		return nil, errListen
 	}
+	_ = tcpConn.SetDeadline(time.Time{})
 
 	log.Printf("[服务端UDP] SOCKS5 UDP中继: %s -> %s", rAddr, targetAddr)
 	return &SOCKS5UDPRelay{
 		tcpConn:    tcpConn,
 		udpConn:    localUDP,
 		relayAddr:  rAddr,
-		targetAddr: tAddr,
+		targetAddr: targetAddr,
 	}, nil
 }
 
 func (r *SOCKS5UDPRelay) Write(data []byte) (int, error) {
-	if r == nil || r.udpConn == nil || r.relayAddr == nil || r.targetAddr == nil {
+	if r == nil || r.udpConn == nil || r.relayAddr == nil || r.targetAddr == "" {
 		return 0, errors.New("SOCKS5 UDP relay 未初始化")
 	}
 	r.mu.Lock()
@@ -713,8 +755,18 @@ func (r *SOCKS5UDPRelay) Write(data []byte) (int, error) {
 	if r.closed {
 		return 0, errors.New("closed")
 	}
-	pkt := buildSOCKS5UDPPacketData(r.targetAddr, data)
-	return r.udpConn.WriteToUDP(pkt, r.relayAddr)
+	pkt, err := buildSOCKS5UDPPacketData(r.targetAddr, data)
+	if err != nil {
+		return 0, err
+	}
+	n, err := r.udpConn.WriteToUDP(pkt, r.relayAddr)
+	if err != nil {
+		return 0, err
+	}
+	if n != len(pkt) {
+		return 0, io.ErrShortWrite
+	}
+	return len(data), nil
 }
 
 func (r *SOCKS5UDPRelay) Read(buffer []byte) (int, *net.UDPAddr, error) {
@@ -762,20 +814,20 @@ func (r *SOCKS5UDPRelay) Close() error {
 	return nil
 }
 
-func buildSOCKS5UDPPacketData(target *net.UDPAddr, data []byte) []byte {
-	packet := []byte{0x00, 0x00, 0x00}
-	if ip4 := target.IP.To4(); ip4 != nil {
-		packet = append(packet, 0x01)
-		packet = append(packet, ip4...)
-	} else {
-		packet = append(packet, 0x04)
-		packet = append(packet, target.IP...)
+func buildSOCKS5UDPPacketData(target string, data []byte) ([]byte, error) {
+	host, port, err := splitHostPort(target)
+	if err != nil {
+		return nil, err
 	}
-	portBytes := make([]byte, 2)
-	binary.BigEndian.PutUint16(portBytes, uint16(target.Port))
-	packet = append(packet, portBytes...)
+	address, err := encodeSOCKS5Address(host, port)
+	if err != nil {
+		return nil, err
+	}
+	packet := make([]byte, 0, 3+len(address)+len(data))
+	packet = append(packet, 0x00, 0x00, 0x00)
+	packet = append(packet, address...)
 	packet = append(packet, data...)
-	return packet
+	return packet, nil
 }
 
 func parseSOCKS5UDPResp(packet []byte) (*net.UDPAddr, []byte, error) {
@@ -1459,59 +1511,127 @@ func readSmuxOpenHeader(r io.Reader) (byte, byte, string, error) {
 	return kind, strategy, string(targetRaw), nil
 }
 
+func encodeProxyStreamTarget(proxy, target string) (string, error) {
+	if proxy == "" {
+		return "", errors.New("SOCKS5 代理地址为空")
+	}
+	if target == "" {
+		return "", errors.New("目标地址为空")
+	}
+	if len(proxy) > maxProxyAddrLength {
+		return "", fmt.Errorf("SOCKS5 地址过长（最大 %d 字节）", maxProxyAddrLength)
+	}
+	if 2+len(proxy)+len(target) > 65535 {
+		return "", errors.New("代理地址和目标地址总长度超过协议限制")
+	}
+	payload := make([]byte, 2+len(proxy)+len(target))
+	binary.BigEndian.PutUint16(payload[:2], uint16(len(proxy)))
+	copy(payload[2:], proxy)
+	copy(payload[2+len(proxy):], target)
+	return string(payload), nil
+}
+
+func decodeProxyStreamTarget(payload string) (string, string, error) {
+	raw := []byte(payload)
+	if len(raw) < 2 {
+		return "", "", errors.New("代理流头过短")
+	}
+	proxyLen := int(binary.BigEndian.Uint16(raw[:2]))
+	if proxyLen == 0 || proxyLen > maxProxyAddrLength || 2+proxyLen >= len(raw) {
+		return "", "", errors.New("代理流头中的地址长度无效")
+	}
+	return string(raw[2 : 2+proxyLen]), string(raw[2+proxyLen:]), nil
+}
+
+func resolveStreamRoute(kind byte, payload string, defaultProxy *SOCKS5Config) (byte, string, *SOCKS5Config, error) {
+	switch kind {
+	case streamKindTCP, streamKindUDP:
+		if payload == "" {
+			return 0, "", nil, errors.New("目标地址为空")
+		}
+		return kind, payload, defaultProxy, nil
+	case streamKindTCPProxy, streamKindUDPProxy:
+		proxy, target, err := decodeProxyStreamTarget(payload)
+		if err != nil {
+			return 0, "", nil, err
+		}
+		config, err := parseSOCKS5Addr(proxy)
+		if err != nil {
+			return 0, "", nil, fmt.Errorf("无效的客户端 SOCKS5 配置: %w", err)
+		}
+		baseKind := streamKindTCP
+		if kind == streamKindUDPProxy {
+			baseKind = streamKindUDP
+		}
+		return baseKind, target, config, nil
+	default:
+		return 0, "", nil, fmt.Errorf("未知流类型: %d", kind)
+	}
+}
+
+func routeLabel(config *SOCKS5Config) string {
+	if config == nil {
+		return "直连"
+	}
+	return "SOCKS5 " + config.Host
+}
+
 func handleSmuxStream(session *ClientSession, ch *WSChannel, stream *smux.Stream) {
 	defer stream.Close()
-	kind, strategy, target, err := readSmuxOpenHeader(stream)
+	kind, strategy, payload, err := readSmuxOpenHeader(stream)
 	if err != nil {
 		return
 	}
-	switch kind {
-	case streamKindProxy:
-		targetLen := len(target)
-		if targetLen > 0 && targetLen < 256 {
-			socks5Config, _ = parseSOCKS5Addr(target)
-			if socks5Config != nil {
-				log.Printf("[服务端] 客户端 %s 设置 SOCKS5 前置代理: %s", shortID(session.clientID), target)
-			}
-		}
-		return
-	case streamKindPing:
+	if kind == streamKindPing {
 		payload := make([]byte, 8)
 		if _, err := io.ReadFull(stream, payload); err != nil {
 			return
 		}
 		_, _ = stream.Write(payload)
+		return
+	}
+
+	kind, target, streamProxy, err := resolveStreamRoute(kind, payload, serverSOCKS5Config)
+	if err != nil {
+		log.Printf("[服务端] 客户ID:%s 拒绝无效流: %v, 通道:%d", shortID(session.clientID), err, ch.id)
+		return
+	}
+	route := routeLabel(streamProxy)
+	switch kind {
 	case streamKindTCP:
-		log.Printf("[服务端] 客户ID:%s TCP 打开: %s, 通道:%d", shortID(session.clientID), target, ch.id)
+		log.Printf("[服务端] 客户ID:%s TCP 打开: %s, 出站:%s, 通道:%d", shortID(session.clientID), target, route, ch.id)
 		var tcpConn net.Conn
-		if socks5Config != nil {
-			tcpConn, err = dialViaSocks5("tcp", target)
+		if streamProxy != nil {
+			tcpConn, err = dialViaSocks5(streamProxy, "tcp", target)
 		} else {
 			tcpConn, err = dialTCPWithStrategy(target, strategy)
 		}
 		if err != nil {
+			log.Printf("[服务端] 客户ID:%s TCP 连接失败: %s, 出站:%s, 错误:%v, 通道:%d", shortID(session.clientID), target, route, err, ch.id)
 			return
 		}
 		proxyConnStream(tcpConn, stream)
 		log.Printf("[服务端] 客户ID:%s TCP 关闭: %s, 通道:%d", shortID(session.clientID), target, ch.id)
 	case streamKindUDP:
-		log.Printf("[服务端] 客户ID:%s SOCKS5 UDP 访问: %s, 通道:%d", shortID(session.clientID), target, ch.id)
+		log.Printf("[服务端] 客户ID:%s SOCKS5 UDP 访问: %s, 出站:%s, 通道:%d", shortID(session.clientID), target, route, ch.id)
 		var relay UDPRelayer
-		if socks5Config != nil {
+		if streamProxy != nil {
 			var socksRelay *SOCKS5UDPRelay
-			socksRelay, err = newSOCKS5UDPRelay(target)
+			socksRelay, err = newSOCKS5UDPRelay(streamProxy, target)
 			if err != nil {
-				log.Printf("[服务端] 客户ID:%s SOCKS5 UDP中继创建失败: %v, 通道:%d", shortID(session.clientID), err, ch.id)
+				log.Printf("[服务端] 客户ID:%s SOCKS5 UDP中继创建失败: %v, 出站:%s, 通道:%d", shortID(session.clientID), err, route, ch.id)
 				return
 			}
 			relay = socksRelay
 		} else {
 			addr, errResolve := resolveUDPWithStrategy(target, strategy)
 			if errResolve != nil {
+				log.Printf("[服务端] 客户ID:%s UDP 目标解析失败: %s, 错误:%v, 通道:%d", shortID(session.clientID), target, errResolve, ch.id)
 				return
 			}
 			udpConn, errListen := net.ListenUDP("udp", nil)
 			if errListen != nil {
+				log.Printf("[服务端] 客户ID:%s UDP 监听创建失败: %v, 通道:%d", shortID(session.clientID), errListen, ch.id)
 				return
 			}
 			relay = &DirectUDPRelayer{conn: udpConn, target: addr}
@@ -1821,11 +1941,21 @@ func writeSmuxOpenHeader(w io.Writer, kind byte, strategy byte, target string) e
 }
 
 func (p *ECHPool) openTCPStream(target string) (*smux.Stream, int, int, error) {
+	kind := streamKindTCP
+	wireTarget := target
+	if proxyAddr != "" {
+		var err error
+		wireTarget, err = encodeProxyStreamTarget(proxyAddr, target)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		kind = streamKindTCPProxy
+	}
 	s, chID, decision, err := p.openBestStream()
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	if err := writeSmuxOpenHeader(s, streamKindTCP, ipStrategy, target); err != nil {
+	if err := writeSmuxOpenHeader(s, kind, ipStrategy, wireTarget); err != nil {
 		_ = s.Close()
 		return nil, 0, 0, err
 	}
@@ -1833,11 +1963,21 @@ func (p *ECHPool) openTCPStream(target string) (*smux.Stream, int, int, error) {
 }
 
 func (p *ECHPool) openUDPStream(target string) (*smux.Stream, int, int, error) {
+	kind := streamKindUDP
+	wireTarget := target
+	if proxyAddr != "" {
+		var err error
+		wireTarget, err = encodeProxyStreamTarget(proxyAddr, target)
+		if err != nil {
+			return nil, 0, 0, err
+		}
+		kind = streamKindUDPProxy
+	}
 	s, chID, decision, err := p.openBestStream()
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	if err := writeSmuxOpenHeader(s, streamKindUDP, ipStrategy, target); err != nil {
+	if err := writeSmuxOpenHeader(s, kind, ipStrategy, wireTarget); err != nil {
 		_ = s.Close()
 		return nil, 0, 0, err
 	}
